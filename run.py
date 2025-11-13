@@ -9,6 +9,8 @@ import time
 import random
 import asyncio
 
+from functools import lru_cache
+
 from geopy.distance import geodesic
 
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
@@ -60,6 +62,12 @@ def bd09Towgs84(position):
     wgs_p["lng"] = gcj_lng * 2 - gcj_lng - d_lng
     return wgs_p
 
+@lru_cache(maxsize=1000)
+def bd09Towgs84_cached(lng, lat):
+    """缓存版本的坐标转换"""
+    position = {'lng': lng, 'lat': lat}
+    return bd09Towgs84(position)
+
 # get the ditance according to the latitude and longitude
 def geodistance(p1, p2):
     return geodesic((p1["lat"],p1["lng"]),(p2["lat"],p2["lng"])).m
@@ -84,69 +92,75 @@ def randLoc(loc: list, d=0.000025, n=5):
         center["lng"] += i["lng"]
     center["lat"] /= len(result)
     center["lng"] /= len(result)
+
+    # 预计算单位向量
+    vectors = []
+    for p in result:
+        vec_lat = p["lat"] - center["lat"]
+        vec_lng = p["lng"] - center["lng"]
+        distance = math.sqrt(vec_lat**2 + vec_lng**2)
+        if distance == 0:
+            vectors.append({"lat": 0, "lng": 0})
+        else:
+            vectors.append({"lat": vec_lat / distance, "lng": vec_lng / distance})
+
     random.seed(time.time())
     for i in range(n):
         start = int(i*len(result)/n)
         end = int((i+1)*len(result)/n)
         offset = (2*random.random()-1) * d
         for j in range(start, end):
-            distance = math.sqrt(
-                (result[j]["lat"]-center["lat"])**2 + (result[j]["lng"]-center["lng"])**2
-            )
-            if 0 == distance:
-                continue
-            result[j]["lat"] +=  (result[j]["lat"]-center["lat"])/distance*offset*smooth(start, end, j)
-            result[j]["lng"] +=  (result[j]["lng"]-center["lng"])/distance*offset*smooth(start, end, j)
-    start = int(i*len(result)/n)
+            smoothed_offset = offset * smooth(start, end, j)
+            result[j]["lat"] += vectors[j]["lat"] * smoothed_offset
+            result[j]["lng"] += vectors[j]["lng"] * smoothed_offset
+
+    start = int((n-1)*len(result)/n) # 确保从正确的起点开始
     end = len(result)
     offset = (2*random.random()-1) * d
     for j in range(start, end):
-        distance = math.sqrt(
-            (result[j]["lat"]-center["lat"])**2 + (result[j]["lng"]-center["lng"])**2
-        )
-        if 0 == distance:
-            continue
-        result[j]["lat"] +=  (result[j]["lat"]-center["lat"])/distance*offset*smooth(start, end, j)
-        result[j]["lng"] +=  (result[j]["lng"]-center["lng"])/distance*offset*smooth(start, end, j)
+        smoothed_offset = offset * smooth(start, end, j)
+        result[j]["lat"] += vectors[j]["lat"] * smoothed_offset
+        result[j]["lng"] += vectors[j]["lng"] * smoothed_offset
+        
     return result
 
 def fixLockT(loc: list, v, dt):
     fixedLoc = []
-    t = 0
-    T = []
-    T.append(geodistance(loc[1],loc[0])/v)
-    a = loc[0].copy()
-    b = loc[1].copy()
-    j = 0
-    while t < T[0]:
-        xa = a["lat"] + j*(b["lat"]-a["lat"])/(max(1, int(T[0]/dt)))
-        xb = a["lng"] + j*(b["lng"]-a["lng"])/(max(1, int(T[0]/dt)))
-        fixedLoc.append({"lat": xa, "lng": xb})
-        j += 1
-        t += dt
-    for i in range(1, len(loc)):
-        T.append(geodistance(loc[(i+1)%len(loc)],loc[i])/v + T[-1])
-        a = loc[i].copy()
-        b = loc[(i+1)%len(loc)].copy()
-        j = 0
-        while t < T[i]:
-            xa = a["lat"] + j*(b["lat"]-a["lat"])/(max(1, int((T[i]-T[i-1])/dt)))
-            xb = a["lng"] + j*(b["lng"]-a["lng"])/(max(1, int((T[i]-T[i-1])/dt)))
-            fixedLoc.append({"lat": xa, "lng": xb})
-            j += 1
-            t += dt
+    
+    for i in range(len(loc)):
+        a = loc[i]
+        b = loc[(i+1) % len(loc)]
+        
+        distance = geodistance(a, b)
+        steps = max(1, int(distance / (v * dt)))
+        
+        # 预计算增量
+        lat_step = (b["lat"] - a["lat"]) / steps
+        lng_step = (b["lng"] - a["lng"]) / steps
+        
+        for j in range(steps):
+            fixedLoc.append({
+                "lat": a["lat"] + j * lat_step,
+                "lng": a["lng"] + j * lng_step
+            })
+    
     return fixedLoc
 
-def run1(dvt, loc: list, v, dt=0.2):
+async def run1(dvt, loc: list, v, dt=0.2):
     fixedLoc = fixLockT(loc, v, dt)
     nList = (5, 6, 7, 8, 9)
     n = nList[random.randint(0, len(nList)-1)]
     fixedLoc = randLoc(fixedLoc, n=n)  # a path will be divided into n parts for random route
+    location_sim = LocationSimulation(dvt)
     clock = time.time()
+    
     for i in fixedLoc:
-        LocationSimulation(dvt).set(*bd09Towgs84(i).values())
-        while time.time()-clock < dt:
-            pass
+        # 使用缓存的转换（需要将坐标转为可哈希的元组）
+        converted = bd09Towgs84_cached(round(i['lng'], 8), round(i['lat'], 8))
+        location_sim.set(*converted.values())
+        elapsed = time.time() - clock
+        if elapsed < dt:
+            await asyncio.sleep(dt - elapsed)
         clock = time.time()
 
 async def run(address, port, loc: list, v, d=15):
@@ -159,5 +173,5 @@ async def run(address, port, loc: list, v, d=15):
 
     while True:
         vRand = 1000/(1000/v-(2*random.random()-1)*d)
-        run1(dvt, loc, vRand)
+        await run1(dvt, loc, vRand)
         print("跑完一圈了")
