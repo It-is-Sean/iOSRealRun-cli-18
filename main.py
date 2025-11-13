@@ -1,18 +1,13 @@
-import signal
-import logging
-import coloredlogs
-import os
 import asyncio
+import logging
+import os
+import signal
 
+import coloredlogs
 
-from init import init
-from init import tunnel
-from init import route
-
-import run
 import config
-
-
+import run
+from init import init, route, tunnel
 
 debug = os.environ.get("DEBUG", False)
 
@@ -75,4 +70,8 @@ async def main():
 
     
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    
